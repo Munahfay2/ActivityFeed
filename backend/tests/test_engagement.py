@@ -1,4 +1,5 @@
 import os
+import xml.etree.ElementTree as ET
 os.environ.update(DATABASE_URL="sqlite:///./test.db", DEMO_MODE="true", JWT_SECRET="t")
 from fastapi.testclient import TestClient
 from app.main import app
@@ -20,7 +21,7 @@ def test_poll_and_duplicate_vote():
     assert c.post(f"/api/polls/{p['id']}/vote", json={"option_id": oid, "phone": "0711000001"}).status_code == 409
     r = c.get(f"/api/events/{eid}/polls").json()[0]; assert r["responses"] == 1 and r["options"][0]["percent"] == 100
 def test_ussd_vote_feedback_issue():
-    h, eid, sid = setup()
+    h, eid, _ = setup()
     c.post(f"/api/events/{eid}/polls", headers=h, json={"question": "Which one?", "options": ["A", "B"]}).raise_for_status()
     u = lambda t: c.post("/api/webhooks/ussd", data={"phoneNumber": "+254711000002", "text": t}).text
     assert u("4").startswith("CON") and u("4*1").startswith("END Thanks") and "already" in u("4*1")
@@ -37,3 +38,70 @@ def test_attendees_and_checkin():
     rows = c.get(f"/api/events/{eid}/attendees", headers=h).json(); assert len(rows) == 2
     assert c.post(f"/api/events/{eid}/checkin", headers=h, json={"phone": "0711000001"}).json()["checked_in"] is True
     assert c.get(f"/api/events/{eid}/analytics", headers=h).json()["checked_in"] == 1
+
+def test_voice_uses_ussd_event_menu_and_registration_flow():
+    from app import extras, main
+    h, eid, _ = setup()
+    session_id = "voice-menu-flow"
+    session_key = f"voice:{session_id}"
+    extras.VOICE_SESSIONS.pop(session_id, None)
+    main.USSD_EVENT_SELECTION.pop(session_key, None)
+    phone = "+254711009999"
+    c.post(f"/api/events/{eid}/polls", headers=h,
+           json={"question": "Which session?", "options": ["AI", "Security"]})
+    attendees = c.get(f"/api/events/{eid}/attendees", headers=h).json()
+    alert = c.post(f"/api/events/{eid}/voice", headers=h,
+                   json={"message": "Emergency exit at north door", "attendee_ids": [attendees[0]["id"]]})
+    assert alert.status_code == 201
+
+    def call(digits=""):
+        data = {"isActive": "1", "sessionId": session_id, "callerNumber": phone}
+        if digits:
+            data["dtmfDigits"] = digits
+        return c.post("/api/webhooks/voice", data=data)
+
+    event_prompt = call()
+    assert event_prompt.status_code == 200
+    event_prompt_text = "".join(ET.fromstring(event_prompt.content).itertext())
+    assert "Emergency exit at north door" in event_prompt_text and "Select an event" in event_prompt_text
+
+    menu = call("1")
+    menu_prompt = "".join(ET.fromstring(menu.content).itertext())
+    assert "Welcome to Activity Feed" in menu_prompt
+    assert "1. Register" in menu_prompt and "7. Help" in menu_prompt
+
+    updates = call("2")
+    assert "LATEST UPDATES" in "".join(ET.fromstring(updates.content).itertext())
+    back = call("0")
+    assert "Welcome to Activity Feed" in "".join(ET.fromstring(back.content).itertext())
+
+    assert "SCHEDULE" in "".join(ET.fromstring(call("3").content).itertext())
+    assert "Welcome to Activity Feed" in "".join(ET.fromstring(call("0").content).itertext())
+    assert "HELP" in "".join(ET.fromstring(call("7").content).itertext())
+    assert "Welcome to Activity Feed" in "".join(ET.fromstring(call("0").content).itertext())
+
+    confirm = call("1")
+    assert "press 1" in "".join(ET.fromstring(confirm.content).itertext())
+    registered = call("1")
+    assert "phone number is registered" in "".join(ET.fromstring(registered.content).itertext())
+
+    db = main.SessionLocal()
+    attendee = db.query(main.Attendee).filter_by(event_id=eid, phone=phone).first()
+    db.close()
+    assert attendee is not None and attendee.registration_source == "VOICE"
+
+    session_id = "voice-poll-flow"
+    call(); call("1")
+    assert "Which session?" in "".join(ET.fromstring(call("4").content).itertext())
+    assert "vote is counted" in "".join(ET.fromstring(call("1").content).itertext())
+    assert c.get(f"/api/events/{eid}/polls").json()[0]["responses"] == 1
+
+    session_id = "voice-feedback-flow"
+    call(); call("1"); call("5")
+    assert "Rate AI" in "".join(ET.fromstring(call("1").content).itertext())
+    assert "Thank you for your feedback" in "".join(ET.fromstring(call("5").content).itertext())
+
+    session_id = "voice-issue-flow"
+    call(); call("1")
+    assert "REPORT AN ISSUE" in "".join(ET.fromstring(call("6").content).itertext())
+    assert "Issue reported" in "".join(ET.fromstring(call("2").content).itertext())

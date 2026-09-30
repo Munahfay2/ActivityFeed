@@ -1,5 +1,6 @@
 """Polls, feedback, issues, check-in, Airtime rewards, Voice, analytics, extra USSD flows."""
 import os, time, logging, collections
+import xml.etree.ElementTree as ET
 from fastapi import APIRouter, Depends, HTTPException, Form
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -165,11 +166,94 @@ def voice(eid: int, b: VoiceIn, u: User = Depends(organizer), db: Session = Depe
             for r in rows: r.status = "FAILED"
     audit(db, u.id, eid, "VOICE_ALERT", f"recipients={len(rows)}"); db.commit()
     return {"recipients": len(rows), "simulated": not LIVE_AT, "status": rows[0].status}
+VOICE_SESSIONS = {}
+
+def voice_response(prompt, collect_digits=False):
+    root = ET.Element("Response")
+    if collect_digits:
+        action = ET.SubElement(root, "GetDigits", {"numDigits": "1", "timeout": "10"})
+        ET.SubElement(action, "Say").text = prompt
+    else:
+        ET.SubElement(root, "Say").text = prompt
+    return Response(ET.tostring(root, encoding="unicode"), media_type="application/xml")
+
 @router.post("/api/webhooks/voice")
-def voice_webhook(db: Session = Depends(get_db)):
-    i = db.query(FeedItem).filter(FeedItem.channels.contains("VOICE")).order_by(FeedItem.id.desc()).first()
-    say = clean(i.content, 300) if i else "No announcement at this time."
-    return Response(f"<?xml version='1.0'?><Response><Say>{say}</Say></Response>", media_type="application/xml")
+def voice_webhook(isActive: str = Form("1"), sessionId: str = Form(""), callerNumber: str = Form(""),
+                  dtmfDigits: str = Form(""), db: Session = Depends(get_db)):
+    from app.main import USSD_EVENT_SELECTION, register_attendee, ussd_reply
+
+    session_key = f"voice:{sessionId}"
+    if isActive != "1":
+        VOICE_SESSIONS.pop(sessionId, None)
+        USSD_EVENT_SELECTION.pop(session_key, None)
+        return Response("<Response/>", media_type="application/xml")
+
+    phone = norm_phone(callerNumber)
+    if not sessionId or not phone:
+        return voice_response("Sorry, we could not identify this caller.")
+
+    try:
+        event = db.query(Event).filter_by(status="LIVE").order_by(Event.id.desc()).first()
+        if not event:
+            return voice_response("There are no active events right now.")
+
+        is_new_session = sessionId not in VOICE_SESSIONS
+        state = VOICE_SESSIONS.setdefault(sessionId, {
+            "text": "", "awaiting_event": False, "pending_registration": False, "event_id": event.id,
+        })
+        selected_event_id = USSD_EVENT_SELECTION.get(session_key, state["event_id"])
+        event = db.get(Event, selected_event_id) or event
+        db.add(AuditLog(event_id=event.id, action="VOICE_HIT"))
+
+        digits = dtmfDigits.strip()
+        if state["pending_registration"]:
+            if digits == "1":
+                register_attendee(db, event, "Voice caller", phone, "VOICE")
+                result = "END Your phone number is registered. A confirmation SMS is on its way."
+            elif digits == "2":
+                result = "END Registration cancelled."
+            else:
+                result = "CON To register this phone number, press 1. To cancel, press 2."
+            state["pending_registration"] = result.startswith("CON")
+        elif not digits:
+            result = ussd_reply(db, event, phone, "", session_key)
+            if is_new_session:
+                alert = db.query(FeedItem).filter(FeedItem.channels.contains("VOICE")).order_by(FeedItem.id.desc()).first()
+                if alert:
+                    result = f"{result[:4]}Urgent announcement: {clean(alert.content, 300)}. {result[4:]}"
+        elif state["awaiting_event"]:
+            result = ussd_reply(db, event, phone, digits, session_key)
+            state["awaiting_event"] = result.startswith("CON Select an event")
+            state["text"] = ""
+            state["event_id"] = USSD_EVENT_SELECTION.get(session_key, event.id)
+        elif not state["text"] and digits == "1":
+            attendee = db.query(Attendee).filter_by(event_id=event.id, phone=phone).first()
+            if attendee:
+                result = "END You are already registered for this event."
+            else:
+                state["pending_registration"] = True
+                result = "CON To register this phone number, press 1. To cancel, press 2."
+        else:
+            state["text"] = f"{state['text']}*{digits}".strip("*")
+            result = ussd_reply(db, event, phone, state["text"], session_key)
+            if "Welcome to Activity Feed" in result:
+                state["text"] = ""
+
+        db.commit()
+        if result.startswith("CON "):
+            prompt = " ".join(result[4:].split())
+            state["awaiting_event"] = state["awaiting_event"] or "Select an event" in prompt
+            return voice_response(prompt, collect_digits=True)
+
+        VOICE_SESSIONS.pop(sessionId, None)
+        USSD_EVENT_SELECTION.pop(session_key, None)
+        return voice_response(" ".join(result[4:].split()))
+    except Exception:
+        log.exception("Voice flow error")
+        db.rollback()
+        VOICE_SESSIONS.pop(sessionId, None)
+        USSD_EVENT_SELECTION.pop(session_key, None)
+        return voice_response("Sorry, we could not process your request. Please try again later.")
 @router.post("/api/webhooks/sms")
 def sms_inbound(from_: str = Form("", alias="from"), text: str = Form(""), db: Session = Depends(get_db)):
     log.info("Inbound SMS from %s (%d chars)", from_[-4:], len(text)); return {"ok": True}
