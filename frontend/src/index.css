@@ -1,0 +1,10 @@
+@tailwind base; @tailwind components; @tailwind utilities;
+body { @apply bg-chalk text-ink font-sans; }
+:focus-visible { outline: 3px solid #FFC93C; outline-offset: 2px; }
+@layer components {
+  .btn { @apply rounded-lg bg-forest px-4 py-2 font-bold text-white hover:bg-ink disabled:opacity-50; }
+  .btn-signal { @apply rounded-lg bg-signal px-5 py-2.5 font-bold text-ink hover:brightness-95; }
+  .field { @apply w-full rounded-md border border-ink/25 bg-white px-3 py-2; }
+  .lbl { @apply mb-1 block text-sm font-medium; }
+}
+@media (prefers-reduced-motion: no-preference) { .pulse-dot { animation: p 1.6s infinite } @keyframes p { 50% { opacity: .3 } } }
